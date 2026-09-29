@@ -36,6 +36,7 @@ SPOT_TICKER = "/api/v3/ticker/24hr"
 
 last_alert = {}
 active_signals = {}
+REVERSAL_PCT = 0.0048  # 0.48% from the original Entry, both directions
 
 def ema(values, period):
     if len(values) < period:
@@ -127,16 +128,6 @@ async def candles(session, symbol, interval):
         raise RuntimeError(f"no usable futures candles for {symbol} {interval}: {len(c)}")
     return c[-120:]
 
-async def ticker(session, symbol):
-    fs=symbol.replace("USDT","_USDT")
-    d=await get_json(session, FUTURES_TICKER, {"symbol":fs}, base=MEXC_CONTRACT)
-    d=d.get("data",d) if isinstance(d,dict) else d
-    if isinstance(d,list):
-        d=d[0] if d else {}
-    if not isinstance(d,dict) or d.get("lastPrice") is None:
-        raise RuntimeError(f"empty futures ticker for {symbol}")
-    return float(d["lastPrice"])
-
 async def depth(session, symbol):
     fs=symbol.replace("USDT","_USDT")
     d=await get_json(session, f"{FUTURES_DEPTH}/{fs}", {"limit":20}, base=MEXC_CONTRACT)
@@ -195,64 +186,88 @@ def score_setup(c1h,c15,c5,c1m,bids,asks):
     reasons=reasons_l if side=="LONG" else reasons_s
     return side, score, reasons, mid, r, obi, vol_ratio
 
-def initial_levels(side, entry, atrv, old_sl=None, old_tp=None):
-    if old_sl is not None and old_tp is not None:
-        return entry, old_sl, old_tp
-    risk=max(atrv*0.8, entry*0.0025)
-    target=max(entry*0.006, risk*1.5)
-    if side=="LONG":
-        return entry, entry-risk, entry+target
-    return entry, entry+risk, entry-target
+async def ticker(session, symbol):
+    """Return the latest MEXC perpetual futures price."""
+    fs = symbol.replace("USDT", "_USDT")
+    d = await get_json(
+        session, FUTURES_TICKER, {"symbol": fs}, base=MEXC_CONTRACT
+    )
+    data = d.get("data", d) if isinstance(d, dict) else d
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"empty futures ticker for {symbol}")
+    last = data.get("lastPrice")
+    if last is None:
+        raise RuntimeError(f"ticker has no lastPrice for {symbol}")
+    return float(last)
 
-def reversal_signal(symbol, state, price, trigger_side):
-    old=state["side"]
-    new="SHORT" if old=="LONG" else "LONG"
-    e=state["entry"]
-    old_sl=state["sl"]
-    old_tp=state["tp"]
-    icon="🔴 SHORT REVERSAL" if new=="SHORT" else "🟢 LONG REVERSAL"
-    now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+def reversal_levels(entry):
+    move = entry * REVERSAL_PCT
+    return entry + move, entry - move
+
+
+def fmt_reversal(symbol, state, price, trigger):
+    old_side = state["side"]
+    new_side = "SHORT" if old_side == "LONG" else "LONG"
+    entry = state["entry"]
+    old_sl = state["sl"]
+    old_tp = state["tp"]
+    upper, lower = reversal_levels(entry)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return (
         f"🐟 SMALLFISH REVERSAL\n\n"
-        f"{icon} {symbol}\n\n"
+        f"{'🟢' if new_side == 'LONG' else '🔴'} {new_side} {symbol}\n\n"
         f"Entry: {price:.8g}\n"
-        f"TP1: {e:.8g}  ← previous Entry\n"
+        f"TP1: {entry:.8g}  ← previous Entry\n"
         f"TP2: {old_sl:.8g}  ← previous SL\n"
         f"SL: {old_tp:.8g}  ← previous TP\n\n"
-        f"0.48% trigger: {'TP-side' if trigger_side=='TP' else 'SL-side'} ✓\n"
-        f"Original {old}: Entry {e:.8g} | SL {old_sl:.8g} | TP {old_tp:.8g}\n\n"
+        f"0.48% trigger: {'+' if trigger == 'UP' else '-'}0.48% from Entry ✓\n"
+        f"Trigger level: {(upper if trigger == 'UP' else lower):.8g}\n"
+        f"Original {old_side}: Entry {entry:.8g} | SL {old_sl:.8g} | TP {old_tp:.8g}\n\n"
         f"⚠️ Signal-only. No orders are placed.\n{now}"
     )
 
-async def check_reversal(symbol, price, state, telegram_send):
-    if state.get("reversed"):
+
+async def check_reversal(session, symbol, price):
+    state = active_signals.get(symbol)
+    if not state or state.get("reversed"):
         return False
-    e=state["entry"]
-    sl=state["sl"]
-    tp=state["tp"]
-    up=e*1.0048
-    down=e*0.9952
 
-    if state["side"]=="LONG":
-        if price >= up:
-            trigger="TP"
-        elif price <= down:
-            trigger="SL"
-        else:
-            return False
-    else:
-        if price <= down:
-            trigger="TP"
-        elif price >= up:
-            trigger="SL"
-        else:
-            return False
+    entry = state["entry"]
+    upper, lower = reversal_levels(entry)
+    LOG.info(
+        "TRACK %s %s entry=%.8g price=%.8g upper=%.8g lower=%.8g",
+        symbol, state["side"], entry, price, upper, lower
+    )
 
-    state["reversed"]=True
-    state["trigger"]=trigger
-    state["trigger_price"]=price
-    await telegram_send(reversal_signal(symbol,state,price,trigger))
+    trigger = None
+    if price >= upper:
+        trigger = "UP"
+    elif price <= lower:
+        trigger = "DOWN"
+
+    if trigger is None:
+        return False
+
+    state["reversed"] = True
+    state["trigger"] = trigger
+    state["trigger_price"] = price
+    new_side = "SHORT" if state["side"] == "LONG" else "LONG"
+    LOG.info(
+        "REVERSAL %s %s -> %s price=%.8g trigger=%s level=%.8g",
+        symbol, state["side"], new_side, price, trigger,
+        upper if trigger == "UP" else lower,
+    )
+    try:
+        await send_telegram(session, fmt_reversal(symbol, state, price, trigger))
+    except Exception:
+        # Do not lose the trigger state if Telegram is temporarily unavailable.
+        state["reversed"] = False
+        raise
     return True
+
 
 async def send_telegram(session, text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -310,6 +325,18 @@ async def main():
             signals=0
             for symbol in SYMBOLS:
                 try:
+                    # Reversal monitoring is independent of the signal scan.
+                    # It checks the live futures ticker first, so a 0.48% move
+                    # cannot be skipped just because candle/order-book scanning fails.
+                    price = await ticker(session, symbol)
+                    await check_reversal(session, symbol, price)
+
+                    # While an original signal is still being tracked, do not
+                    # replace it with another base signal for the same symbol.
+                    active = active_signals.get(symbol)
+                    if active and not active.get("reversed"):
+                        continue
+
                     c1h,c15,c5,c1m = await asyncio.gather(
                         candles(session,symbol,"Hour1"),
                         candles(session,symbol,"Min15"),
@@ -317,47 +344,43 @@ async def main():
                         candles(session,symbol,"Min1"),
                     )
                     bids,asks=await depth(session,symbol)
-                    price=await ticker(session,symbol)
-                    active=active_signals.get(symbol)
-                    if active and not active.get("reversed"):
-                        try:
-                            if await check_reversal(
-                                symbol, price, active,
-                                lambda text: send_telegram(session,text)
-                            ):
-                                LOG.info(
-                                    "REVERSAL %s %s at %.8g (%s-side 0.48%%)",
-                                    symbol, active["side"], price, active["trigger"]
-                                )
-                        except Exception as e:
-                            LOG.warning("%s reversal check failed: %s",symbol,e)
-    
-                    if active_signals.get(symbol) and not active_signals[symbol].get("reversed"):
-                        continue
-    
                     side,score,reasons,entry,rsi_v,obi,vr=score_setup(
-                            c1h,c15,c5,c1m,bids,asks
-                        )
+                        c1h,c15,c5,c1m,bids,asks
+                    )
                     if score < MIN_SCORE:
                         continue
                     key=f"{symbol}:{side}"
                     now=time.time()
                     if now-last_alert.get(key,0) < ALERT_COOLDOWN:
                         continue
-                    at=atr(c5)
-                    msg=fmt_signal(symbol,side,score,entry,at,reasons,rsi_v,obi,vr)
+                    msg=fmt_signal(symbol,side,score,entry,atr(c5),reasons,rsi_v,obi,vr)
                     LOG.info("SIGNAL %s %s score=%.0f entry=%s",side,symbol,score,entry)
                     await send_telegram(session,msg)
                     last_alert[key]=now
-                    _, old_sl, old_tp = initial_levels(side,entry,at)
-                    active_signals[symbol]={
-                        "side":side,
-                        "entry":entry,
-                        "sl":old_sl,
-                        "tp":old_tp,
-                        "reversed":False,
-                        "created":now,
+
+                    # Save the original signal levels. Reversal monitoring then
+                    # watches exactly +/-0.48% from this Entry.
+                    risk=max(atr(c5)*0.8, entry*0.0025)
+                    target=max(entry*0.006, risk*1.5)
+                    if side == "LONG":
+                        original_sl = entry - risk
+                        original_tp = entry + target
+                    else:
+                        original_sl = entry + risk
+                        original_tp = entry - target
+                    active_signals[symbol] = {
+                        "side": side,
+                        "entry": entry,
+                        "sl": original_sl,
+                        "tp": original_tp,
+                        "reversed": False,
+                        "created": now,
                     }
+                    upper, lower = reversal_levels(entry)
+                    LOG.info(
+                        "TRACK START %s %s entry=%.8g upper=%.8g lower=%.8g",
+                        symbol, side, entry, upper, lower
+                    )
                     signals+=1
                 except Exception as e:
                     LOG.warning("%s scan failed: %s",symbol,e)
